@@ -1,0 +1,41 @@
+
+---
+# ---- Galera cluster --------------------------------------------------------
+shard_id: 1
+cluster_name: "galera-shard-001"
+
+# Keep false except when deliberately initializing a new cluster.
+galera_bootstrap_confirmed: true
+
+# Keep this alias for existing templates or roles using the old variable name.
+galera_cluster_name: "{{ cluster_name }}"
+
+node_ips:
+  - "192.168.0.151"
+  - "192.168.0.152"
+
+# CHANGE this to suit the actual RAM on each VM.
+# Example only: suitable starting point for a 16 GB VM.
+buffer_pool_size: "1G"
+
+# ---- Galera accounts -------------------------------------------------------
+sst_user: "sstuser"
+monitor_user: "proxysql_mon"
+monitor_password: "{{ proxysql_mon_password }}"
+app_user: "appuser"
+app_database: "appdb"
+
+# ---- ProxySQL (Kubernetes) -------------------------------------------------
+proxysql_admin_password: "{{ vault_proxysql_admin_password }}"
+proxysql_image: "proxysql/proxysql:3.0.11"
+proxysql_replicas: 2
+proxysql_server_version: "8.0.30"
+
+# ---- garbd arbitrator (Kubernetes) -----------------------------------------
+garbd_image: "ubuntu:24.04"
+garbd_install_on_start: true
+garbd_node_selector: {}
+
+# ---- Kubernetes ------------------------------------------------------------
+k8s_namespace: "galera-proxy"
+

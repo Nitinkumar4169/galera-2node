@@ -1,0 +1,190 @@
+---
+# Galera role tasks
+# Run this role with serial: 1. Keep galera_bootstrap_confirmed=false except
+# for the explicitly approved first bootstrap of node1. Set it back to false
+# after the initial cluster deployment succeeds.
+
+# 1. Inspect the node before changing anything
+- name: Check whether MariaDB is currently active
+  ansible.builtin.command:
+    argv: [systemctl, is-active, mariadb]
+  register: mariadb_active_before
+  changed_when: false
+  failed_when: false
+
+- name: Check current Galera Primary status
+  ansible.builtin.command:
+    argv:
+      - mysql
+      - -Nse
+      - "SHOW GLOBAL STATUS LIKE 'wsrep_cluster_status';"
+  register: wsrep_primary_before
+  changed_when: false
+  failed_when: false
+  when: mariadb_active_before.stdout == "active"
+
+- name: Check current Galera local state
+  ansible.builtin.command:
+    argv:
+      - mysql
+      - -Nse
+      - "SHOW GLOBAL STATUS LIKE 'wsrep_local_state_comment';"
+  register: wsrep_state_before
+  changed_when: false
+  failed_when: false
+  when: mariadb_active_before.stdout == "active"
+
+- name: Check whether Galera is ready
+  ansible.builtin.command:
+    argv:
+      - mysql
+      - -Nse
+      - "SHOW GLOBAL STATUS LIKE 'wsrep_ready';"
+  register: wsrep_ready_before
+  changed_when: false
+  failed_when: false
+  when: mariadb_active_before.stdout == "active"
+
+- name: Identify an already healthy Galera member
+  ansible.builtin.set_fact:
+    cluster_already_healthy: >-
+      {{
+        mariadb_active_before.stdout == 'active'
+        and wsrep_primary_before is defined
+        and 'Primary' in (wsrep_primary_before.stdout | default(''))
+        and wsrep_state_before is defined
+        and 'Synced' in (wsrep_state_before.stdout | default(''))
+        and wsrep_ready_before is defined
+        and 'ON' in (wsrep_ready_before.stdout | default(''))
+      }}
+
+# Never bootstrap automatically just because a node is unhealthy.
+- name: Require explicit approval to bootstrap node1
+  ansible.builtin.assert:
+    that:
+      - >-
+        cluster_already_healthy
+        or inventory_hostname != groups['galera'][0]
+        or (galera_bootstrap_confirmed | default(false) | bool)
+    fail_msg: >-
+      Node1 is not currently a healthy Galera member.
+      Bootstrap has not been explicitly authorized. Inspect the MariaDB
+      and Galera state before setting galera_bootstrap_confirmed=true.
+
+# 2. Install packages and deploy configuration
+- name: Install MariaDB and Galera packages
+  ansible.builtin.apt:
+    name:
+      - mariadb-server
+      - mariadb-backup
+      - galera-4
+      - rsync
+      - socat
+    state: present
+    update_cache: true
+  environment:
+    DEBIAN_FRONTEND: noninteractive
+
+- name: Deploy Galera configuration
+  ansible.builtin.template:
+    src: 60-galera.cnf.j2
+    dest: /etc/mysql/mariadb.conf.d/60-galera.cnf
+    owner: root
+    group: mysql
+    mode: "0640"
+  register: galera_config
+# Do not silently restart an already healthy cluster after a config change.
+- name: Stop if configuration changed on an already healthy member
+  ansible.builtin.assert:
+    that:
+      - not galera_config.changed
+    fail_msg: >-
+      Galera configuration changed on an already healthy member.
+      No automatic restart was attempted. Review the change and perform
+      planned rolling maintenance.
+  when: cluster_already_healthy
+
+# 3. Start or join the cluster
+- name: Stop MariaDB before first bootstrap or join
+  ansible.builtin.systemd:
+    name: mariadb
+    state: stopped
+  when: not cluster_already_healthy
+
+- name: Bootstrap node1 only
+  ansible.builtin.command:
+    argv: [galera_new_cluster]
+  when:
+    - inventory_hostname == groups['galera'][0]
+    - not cluster_already_healthy
+    - galera_bootstrap_confirmed | default(false) | bool
+
+- name: Start MariaDB on node2 to join the existing cluster
+  ansible.builtin.systemd:
+    name: mariadb
+    state: started
+  when:
+    - inventory_hostname != groups['galera'][0]
+    - not cluster_already_healthy
+
+- name: Wait for MariaDB to accept local connections
+  ansible.builtin.wait_for:
+    host: 127.0.0.1
+    port: 3306
+    timeout: 120
+
+# 4. Ensure accounts and application database on node1.
+# These tasks also run on later playbook runs when node1 is already healthy.
+- name: Ensure SST, monitoring and application accounts on node1
+  ansible.builtin.command:
+    argv:
+      - mysql
+      - -e
+      - "{{ item }}"
+  loop:
+    - >-
+      CREATE USER IF NOT EXISTS '{{ sst_user }}'@'%'
+      IDENTIFIED BY '{{ sst_password }}';
+    - >-
+      ALTER USER '{{ sst_user }}'@'%'
+      IDENTIFIED BY '{{ sst_password }}';
+    - >-
+      GRANT RELOAD, PROCESS, LOCK TABLES, BINLOG MONITOR
+      ON *.* TO '{{ sst_user }}'@'%';
+    - >-
+      CREATE USER IF NOT EXISTS '{{ monitor_user }}'@'%'
+      IDENTIFIED BY '{{ monitor_password }}';
+    - >-
+      ALTER USER '{{ monitor_user }}'@'%'
+      IDENTIFIED BY '{{ monitor_password }}';
+    - >-
+      GRANT USAGE, REPLICATION CLIENT
+      ON *.* TO '{{ monitor_user }}'@'%';
+    - >-
+      CREATE DATABASE IF NOT EXISTS `{{ app_database }}`;
+    - >-
+      CREATE USER IF NOT EXISTS '{{ app_user }}'@'%'
+      IDENTIFIED BY '{{ app_password }}';
+    - >-
+      ALTER USER '{{ app_user }}'@'%'
+      IDENTIFIED BY '{{ app_password }}';
+    - >-
+      GRANT SELECT, INSERT, UPDATE, DELETE
+      ON `{{ app_database }}`.*
+      TO '{{ app_user }}'@'%';
+  when:
+    - inventory_hostname == groups['galera'][0]
+  no_log: true
+
+# 5. Wait for actual Galera synchronization, not just an open TCP port.
+- name: Wait until this node reports Synced
+  ansible.builtin.command:
+    argv:
+      - mysql
+      - -Nse
+      - "SHOW GLOBAL STATUS LIKE 'wsrep_local_state_comment';"
+  register: wsrep_state
+  until: "'Synced' in wsrep_state.stdout"
+  retries: 60
+  delay: 10
+  changed_when: false

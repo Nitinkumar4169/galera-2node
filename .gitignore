@@ -1,0 +1,15 @@
+build/
+*.retry
+build/
+*.retry
+*.backup
+*vault-pass*
+group_vars/all/vault.yml
+*vault-pass*
+*.pem
+*.key
+id_*
+build/
+*.retry
+*.backup
+pre-galera-setup.sql

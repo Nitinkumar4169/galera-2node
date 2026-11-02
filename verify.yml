@@ -1,0 +1,54 @@
+
+---
+# Run only AFTER the Galera cluster is healthy
+# and garbd has been deployed to Kubernetes.
+- name: Verify Galera cluster and garbd
+  hosts: galera
+  become: true
+  gather_facts: false
+
+  tasks:
+    - name: Wait until garbd joins the cluster
+      ansible.builtin.command:
+        argv:
+          - mysql
+          - -N
+          - -e
+          - SHOW GLOBAL STATUS LIKE 'wsrep_cluster_size';
+      register: size
+      until: (size.stdout.split() | last | int) == 3
+      retries: 60
+      delay: 10
+      changed_when: false
+
+    - name: Read Galera health status
+      ansible.builtin.command:
+        argv:
+          - mysql
+          - -N
+          - -e
+          - >-
+            SHOW GLOBAL STATUS WHERE Variable_name IN
+            ('wsrep_cluster_size','wsrep_cluster_status',
+            'wsrep_local_state_comment','wsrep_ready',
+            'wsrep_incoming_addresses');
+      register: health
+      changed_when: false
+
+    - name: Display Galera status
+      ansible.builtin.debug:
+        var: health.stdout_lines
+
+    - name: Assert cluster is healthy
+      ansible.builtin.assert:
+        that:
+          - health.stdout_lines | select('match', '^wsrep_cluster_size\s+3$') | list | length == 1
+          - health.stdout_lines | select('match', '^wsrep_cluster_status\s+Primary$') | list | length == 1
+          - health.stdout_lines | select('match', '^wsrep_local_state_comment\s+Synced$') | list | length == 1
+          - health.stdout_lines | select('match', '^wsrep_ready\s+ON$') | list | length == 1
+        fail_msg: >-
+          {{ inventory_hostname }} is not healthy.
+          Expected cluster size 3, Primary, Synced and Ready.
+        success_msg: >-
+          {{ inventory_hostname }}: cluster size 3,
+          Primary, Synced and Ready.

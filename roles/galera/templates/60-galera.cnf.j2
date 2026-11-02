@@ -1,0 +1,31 @@
+
+[mysqld]
+
+# Network
+bind-address = 0.0.0.0
+port = 3306
+
+# MariaDB settings
+default_storage_engine = InnoDB
+binlog_format = ROW
+innodb_autoinc_lock_mode = 2
+innodb_file_per_table = 1
+innodb_flush_log_at_trx_commit = 2
+
+# Memory and connections
+innodb_buffer_pool_size = {{ buffer_pool_size }}
+innodb_log_file_size = 256M
+max_connections = 100
+table_open_cache = 1000
+table_definition_cache = 1000
+
+# Galera configuration
+wsrep_on = ON
+wsrep_provider = /usr/lib/galera/libgalera_smm.so
+wsrep_cluster_name = "{{ cluster_name }}"
+wsrep_cluster_address = "gcomm://{{ node_ips | join(',') }}"
+wsrep_node_name = "{{ inventory_hostname }}"
+wsrep_node_address = "{{ private_ip }}"
+wsrep_sst_method = mariabackup
+wsrep_sst_auth = "{{ sst_user }}:{{ sst_password }}"
+wsrep_slave_threads = 2

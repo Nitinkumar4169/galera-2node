@@ -1,0 +1,189 @@
+---
+# Play 1: Preflight checks
+# Runs locally and makes no changes to the database servers.
+- name: Preflight checks
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars_files:
+    - group_vars/all.yml
+    - group_vars/all/vault.yml
+  tags:
+    - always
+
+  tasks:
+    - name: Verify exactly two Galera nodes are configured
+      ansible.builtin.assert:
+        that:
+          - groups['galera'] | length == 2
+        fail_msg: >-
+          This configuration requires exactly two Galera nodes
+          plus garbd as an arbitrator.
+
+    - name: Verify required configuration variables exist
+      ansible.builtin.assert:
+        that:
+          - buffer_pool_size is defined
+          - cluster_name is defined
+          - node_ips is defined
+          - node_ips | length == 2
+          - sst_user is defined
+          - monitor_user is defined
+          - app_user is defined
+          - app_database is defined
+          - app_database | string | length > 0
+        fail_msg: >-
+          Required configuration variables are missing.
+          Define app_database in group_vars/all.yml before deployment.
+
+    - name: Validate inventory IP addresses
+      ansible.builtin.assert:
+        that:
+          - hostvars[item].ansible_host is defined
+          - hostvars[item].private_ip is defined
+          - hostvars[item].ansible_host is regex('^([0-9]{1,3}\.){3}[0-9]{1,3}$')
+          - hostvars[item].private_ip is regex('^([0-9]{1,3}\.){3}[0-9]{1,3}$')
+        fail_msg: >-
+          {{ item }} must have valid ansible_host and private_ip values.
+      loop: "{{ groups['galera'] }}"
+
+    - name: Verify private IP addresses are unique
+      ansible.builtin.assert:
+        that:
+          - >-
+            (groups['galera']
+            | map('extract', hostvars, 'private_ip')
+            | unique | list | length) == 2
+        fail_msg: The Galera nodes must have different private IP addresses.
+
+    - name: Verify node IP list matches inventory
+      ansible.builtin.assert:
+        that:
+          - node_ips | sort == (groups['galera'] | map('extract', hostvars, 'private_ip') | list | sort)
+        fail_msg: node_ips in group_vars/all.yml must match inventory.ini.
+
+    - name: Verify passwords are configured
+      ansible.builtin.assert:
+        that:
+          - lookup('vars', item) is defined
+          - not (lookup('vars', item) | string).startswith('CHANGE_ME')
+          - (lookup('vars', item) | string | length) >= 16
+        fail_msg: >-
+          A required password is missing, too short, or still a placeholder.
+          Update the encrypted Vault variables.
+      loop:
+        - galera_root_password
+        - sst_password
+        - monitor_password
+        - app_password
+        - proxysql_admin_password
+      no_log: true
+
+    - name: Verify passwords use supported characters
+      ansible.builtin.assert:
+        that:
+          - (lookup('vars', item) | string) is regex('^[A-Za-z0-9_.@%+=-]+$')
+        fail_msg: A password contains unsupported characters.
+      loop:
+        - galera_root_password
+        - sst_password
+        - monitor_password
+        - app_password
+        - proxysql_admin_password
+      no_log: true
+
+
+# Play 2: Deploy the two-node Galera cluster.
+- name: Deploy 2-node Galera cluster
+  hosts: galera
+  become: true
+  gather_facts: true
+  serial: 1
+  vars_files:
+    - group_vars/all.yml
+    - group_vars/all/vault.yml
+  roles:
+    - galera
+  tags:
+    - galera
+
+
+# Play 3: Verify database cluster health.
+- name: Galera health report
+  hosts: galera
+  become: true
+  gather_facts: false
+  vars_files:
+    - group_vars/all.yml
+    - group_vars/all/vault.yml
+  tags:
+    - galera
+
+  tasks:
+    - name: Read Galera status
+      ansible.builtin.command:
+        argv:
+          - mysql
+          - -N
+          - -e
+          - >-
+            SHOW GLOBAL STATUS WHERE Variable_name IN
+            ('wsrep_cluster_size','wsrep_cluster_status',
+            'wsrep_local_state_comment','wsrep_ready');
+      register: galera_health
+      changed_when: false
+
+    - name: Display Galera status
+      ansible.builtin.debug:
+        var: galera_health.stdout_lines
+
+    - name: Assert this node is synchronized and ready
+      ansible.builtin.assert:
+        that:
+          - galera_health.stdout_lines | select('match', '^wsrep_cluster_size\s+2$') | list | length == 1
+          - galera_health.stdout_lines | select('match', '^wsrep_cluster_status\s+Primary$') | list | length == 1
+          - galera_health.stdout_lines | select('match', '^wsrep_local_state_comment\s+Synced$') | list | length == 1
+          - galera_health.stdout_lines | select('match', '^wsrep_ready\s+ON$') | list | length == 1
+        fail_msg: >-
+          {{ inventory_hostname }} is not a synchronized, ready Galera node
+          in a two-node cluster. Do not deploy ProxySQL until the cluster is healthy.
+
+    - name: Explain the expected cluster size
+      ansible.builtin.debug:
+        msg: >-
+          Both database nodes are expected to be healthy and synchronized.
+          The expected cluster size is 2 before garbd joins.
+      run_once: true
+
+
+# Play 4: Render Kubernetes resources.
+# This only creates a local manifest; it does not apply resources to Kubernetes.
+#- name: Render ProxySQL and garbd Kubernetes manifest
+#  hosts: localhost
+#  connection: local
+#  gather_facts: false
+#  vars_files:
+#    - group_vars/all.yml
+#    - group_vars/all/vault.yml
+#  tags:
+#    - k8s
+#
+#  tasks:
+#    - name: Create build directory
+#      ansible.builtin.file:
+#        path: "{{ playbook_dir }}/build"
+#        state: directory
+#        mode: "0700"
+#
+#    - name: Render ProxySQL and garbd manifest
+#      ansible.builtin.template:
+#        src: "{{ playbook_dir }}/k8s/proxysql-garbd.yaml.j2"
+#        dest: "{{ playbook_dir }}/build/proxysql-garbd.yaml"
+#        mode: "0600"
+#
+#    - name: Show next step
+#      ansible.builtin.debug:
+#        msg: >-
+#          Manifest rendered at build/proxysql-garbd.yaml.
+#          Review it before applying it with kubectl.
+#
